@@ -43,6 +43,29 @@ from awex.util.tensor_util import reconstruct_ipc_weights
 logger = logging.getLogger(__name__)
 
 
+def _wait_colocate_write_finished(
+    meta_server_client,
+    write_finished_key: str,
+    weights_update_group,
+) -> None:
+    """Wait until all colocated readers observe the writer's release signal."""
+
+    meta_server_client.get_object(write_finished_key, 1024**3)
+    dist.barrier(
+        group=weights_update_group,
+        device_ids=[device_util.current_device()],
+    )
+    # Keys normally include the local device, but multiple processes can still
+    # share one when CUDA_VISIBLE_DEVICES remaps every process-local GPU to 0.
+    # Cleanup is idempotent, so each rank deletes its own key only after every
+    # rank has observed its corresponding writer signal.
+    meta_server_client.delete_if_exists(write_finished_key)
+    dist.barrier(
+        group=weights_update_group,
+        device_ids=[device_util.current_device()],
+    )
+
+
 class NCCLWorkerWeightsReader(WorkerWeightsReader):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -487,7 +510,11 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         if device_util.get_device_type() == "cuda":
             torch.cuda.empty_cache()
         write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.get_object_then_delete(write_finished_key)
+        _wait_colocate_write_finished(
+            self.meta_server_client,
+            write_finished_key,
+            self.weights_update_group,
+        )
         logger.info(
             f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
         )
